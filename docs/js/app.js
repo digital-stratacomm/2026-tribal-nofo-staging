@@ -1,0 +1,543 @@
+
+(() => {
+  "use strict";
+  
+  const S = window.MAP_SETTINGS;
+  const config = {
+    googleKey: S.googleKey,
+    spreadsheetId: S.spreadsheetId,
+    sheetId: S.sheetTab,
+    url: "https://sheets.googleapis.com/v4/spreadsheets",
+    uiFilters: Object.fromEntries(S.filters.map((f) => [f.column, []])),
+    mapCenter: [-95.84, 37.81],
+    mapZoom: 3,
+    mapboxToken: S.mapboxToken,
+    mapContainer: "map",
+    datatableContainer: "datatable",
+    dataHeaders: S.tableColumns,
+  };
+
+  const esc = (v) =>
+    String(v == null ? "" : v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  function popupHTML(props) {
+    const title = props[S.popupTitle] || "";
+    const sub = S.popupSubtitle.map((c) => props[c]).filter(Boolean).join(", ");
+    return (title ? "<h4>" + esc(title) + "</h4>" : "") + (sub ? "<h5>" + esc(sub) + "</h5>" : "");
+  }
+
+  let map, datatable, data, spiderifier;
+
+  window.onload = function () {
+    init(config);
+  };
+
+  function init(config) {
+    const url = `${config.url}/${config.spreadsheetId}/values/${config.sheetId}?key=${config.googleKey}`;
+    const params = {
+      mode: 'cors',
+    };
+    fetch(url, params)
+      .then(resp => resp.json())
+      .then(render)
+      .catch(console.error);
+  }
+
+  function render(googledata /*, tabletop */) {
+    data = googledata.values; // make the data global
+    const headers = data.shift();
+    data = data.map(row => Object.fromEntries(headers.map((value, index) => [value.trim(), row[index] == null ? "" : String(row[index]).trim()])));
+
+    data = data.filter((row) => {
+      const ok = row[S.latitudeColumn] !== "" && row[S.longitudeColumn] !== "" &&
+        !isNaN(parseFloat(row[S.latitudeColumn])) && !isNaN(parseFloat(row[S.longitudeColumn]));
+      if (!ok) console.warn("Skipping row with missing/invalid coordinates:", row);
+      return ok;
+    });
+    data.forEach((row) => {
+      row[S.latitudeColumn] = parseFloat(row[S.latitudeColumn]);
+      row[S.longitudeColumn] = parseFloat(row[S.longitudeColumn]);
+    });
+
+    linkTitle(data); // mashup the project name and hyperlink
+    buildUI(data);
+    renderMap(config);
+    getFilterValues(config);
+    renderMapMarkers(data);
+    countMarkersFromState("Alaska", data);
+    renderDataTable(data);
+  }
+
+  /**
+   *
+   * buildUI - build the inputs/selects/checkboxes used to control the map and table
+   * @param  {array} data rows from the datasource
+   *
+   */
+  function buildUI(dataarray) {
+    const $ui = $("#ui-controls").empty();
+    S.filters.forEach((f) => {
+      const values = dataarray
+        .flatMap((row) => String(row[f.column] || "").split(",").map((v) => v.trim()))
+        .filter(Boolean)
+        .filter((v, i, arr) => arr.indexOf(v) === i)
+        .sort();
+      const $panel = $('<div class="panel panel-default">').append(
+        $('<div class="panel-heading">').append($('<h3 class="panel-title">').text(f.label || f.column))
+      );
+      let $body;
+      if (f.type === "checkboxes") {
+        $body = $('<div class="panel-body">').attr("data-target", f.column);
+        values.forEach((v) => {
+          $body.append(
+            $('<div class="checkbox">').append(
+              $("<label>").append($('<input type="checkbox">').val(v), " " + v)
+            )
+          );
+        });
+      } else {
+        const $select = $('<select class="form-control">').attr("data-target", f.column);
+        $select.append($('<option value="">').text("All"));
+        values.forEach((v) => $select.append($("<option>").val(v).text(v)));
+        $body = $('<div class="panel-body">').append($select);
+      }
+      $ui.append($panel.append($body));
+    });
+  }
+
+  /**
+   * Wrap the project name in a hyperlink
+   *
+   * @param  {array} data - rows from datasource
+   *
+   */
+  function linkTitle(dataarray) {
+    if (!S.linkColumn) return;
+    dataarray.forEach((row) => {
+      const url = row[S.linkColumn];
+      const text = esc(row[S.linkedColumn]);
+      row[S.linkedColumn] = url ? `<a target="_blank" href="${esc(url)}">${text}</a>` : text;
+    });
+  }
+
+  /**
+   * todo: if one of our headers isn't in the data, prune it so DT doesn't throw an error
+   * [renderDataTable description]
+   * @param  {[type]} data [description]
+   */
+  function renderDataTable(dataarray) {
+    // set up columns properly
+    const columns = config.dataHeaders.map((header) => {
+      return {
+        title: header,
+        data: header,
+      };
+    });
+
+    // swap footer UI element placement
+    const dom =
+      '<"row"<"col-sm-6"l><"col-sm-6"f>>' +
+      '<"row"<"col-sm-12"tr>>' +
+      '<"row"<"col-sm-5"p><"col-sm-7"i>>';
+
+    // init the datatable
+    datatable = $("#" + config.datatableContainer).DataTable({
+      data: dataarray,
+      columns: columns,
+      dom: dom,
+      language: { search: "Search table:" },
+    });
+  }
+
+  /**
+   *
+   * renderMap - set the zoom, coords, tiles, and create a mapbox map
+   * @return {[type]} [description]
+   *
+   */
+  function renderMap(cfg) {
+    mapboxgl.accessToken = cfg.mapboxToken;
+    map = new mapboxgl.Map({
+      container: "map",
+      style: "mapbox://styles/mapbox/light-v11",
+      center: cfg.mapCenter,
+      zoom: cfg.mapZoom,
+      maxZoom: 13,
+      logoPosition: "top-right",
+    });
+
+    // Darken the light-v11 basemap to roughly match the old light-v10 look
+    map.on("style.load", () => {
+      const LAND = "#e6e6e6";
+      const WATER = "#c3ccd1";
+      const STATE_TEXT = "#7a7a7a";  // state/province names
+      const PLACE_TEXT = "#555555";  // cities and countries
+      map.getStyle().layers.forEach((layer) => {
+        const id = layer.id;
+        if (layer.type === "background") {
+          map.setPaintProperty(id, "background-color", LAND);
+        }
+        if (layer.type === "fill" && id.startsWith("water")) {
+          map.setPaintProperty(id, "fill-color", WATER);
+        }
+        if (layer.type === "symbol") {
+          if (id.includes("state")) {
+            map.setPaintProperty(id, "text-color", STATE_TEXT);
+          } else if (id.includes("settlement") || id.includes("country")) {
+            map.setPaintProperty(id, "text-color", PLACE_TEXT);
+          }
+        }
+        // Relabel the Gulf
+        if (layer.type === "symbol" && id.includes("water")) {
+          const label = map.getLayoutProperty(id, "text-field");
+          if (label) {
+            map.setLayoutProperty(id, "text-field", [
+              "case",
+              ["any",
+                ["==", ["get", "name_en"], "Gulf of Mexico"],
+                ["==", ["get", "name"], "Gulf of Mexico"]
+              ],
+              "Gulf of America",
+              label
+            ]);
+          }
+        }
+      });
+    });
+
+    spiderifier = new MapboxglSpiderifier(map, {
+      customPin: true,
+      initializeLeg: function (spiderLeg) {
+        let $spiderPinCustom = $("<div>", { class: "spider-point-circle" });
+        let marker = spiderLeg.feature;
+
+        $(spiderLeg.elements.pin).append($spiderPinCustom);
+        $spiderPinCustom.css({
+          width: "30px",
+          height: "30px",
+          "margin-left": "-15px",
+          "margin-top": "-15px",
+          "background-color": "rgba(8, 183, 241, 1)",
+          "border-radius": "50%",
+        });
+        let content = popupHTML(marker);
+        let popup = new mapboxgl.Popup({
+          closeOnClick: true,
+          offset: MapboxglSpiderifier.popupOffsetForSpiderLeg(spiderLeg),
+        }).addTo(map);
+        popup.setHTML(content);
+        spiderLeg.mapboxMarker.setPopup(popup);
+      },
+    });
+  }
+
+  /**
+   *
+   * getFilterValues - check the state of our UI elements
+   *
+   */
+  function getFilterValues(cfg) {
+    Object.keys(cfg.uiFilters).forEach((filter) => {
+      const $el = $('#ui-controls [data-target="' + filter + '"] :checked');
+
+      cfg.uiFilters[filter].length = 0; // clear out existing array
+
+      $el.each((idx, el) => {
+        if (el.value.length) {
+          cfg.uiFilters[filter].push(el.value);
+        }
+      });
+    });
+  }
+
+  /**
+   *
+   * renderMapMarkers -
+   * @param  {array} data -
+   *
+   */
+
+  function updateSource(dataarray) {
+    let geojsondata = GeoJSON.parse(dataarray, {
+      Point: [S.latitudeColumn, S.longitudeColumn],
+    }); //todo: abstract out lat/lon field
+
+    geojsondata.features = geojsondata.features.filter((feat) =>
+      filterData(feat, config.uiFilters)
+    );
+
+    map.getSource("locations").setData(geojsondata);
+    zoomMapBounds(geojsondata.features, config);
+  }
+
+  function renderMapMarkers(dataarray) {
+    let $ui = $("#ui-controls");
+
+    map.on("load", function () {
+      let geojsondata = GeoJSON.parse(dataarray, {
+        Point: [S.latitudeColumn, S.longitudeColumn],
+      }); //todo: abstract out lat/lon field
+
+      map.addSource("locations", {
+        type: "geojson",
+        data: geojsondata,
+        cluster: true,
+        clusterMaxZoom: 14,
+        clusterRadius: 50,
+      });
+
+      map.addLayer({
+        id: "clusters",
+        type: "circle",
+        source: "locations",
+        filter: ["has", "point_count"],
+        paint: {
+          "circle-color": [
+            "step",
+            ["get", "point_count"],
+            "rgba(8, 183, 241, 1)",
+            10,
+            "rgba(8, 183, 241, 1)", // was "rgba(255, 201, 86, 1)" (yellow, 10+)
+            50,
+            "rgba(8, 183, 241, 1)", // was "rgba(232, 131, 32, 1)" (orange, 50+)
+          ],
+          "circle-radius": 20,
+        },
+      });
+
+      map.addLayer({
+        id: "cluster-count",
+        type: "symbol",
+        source: "locations",
+        filter: ["has", "point_count"],
+        layout: {
+          "text-field": "{point_count_abbreviated}",
+          "text-font": ["DIN Offc Pro Medium", "Arial Unicode MS Bold"],
+          "text-size": 12,
+        },
+      });
+
+      map.addLayer({
+        id: "unclustered-point",
+        type: "circle",
+        source: "locations",
+        filter: ["!", ["has", "point_count"]],
+        paint: {
+          "circle-color": "rgba(8, 183, 241, 1)",
+          "circle-radius": 20,
+        },
+      });
+
+      map.addLayer({
+        id: "unclustered-count",
+        type: "symbol",
+        source: "locations",
+        filter: ["!", ["has", "point_count"]],
+        layout: {
+          "text-field": "1",
+          "text-font": ["DIN Offc Pro Medium", "Arial Unicode MS Bold"],
+          "text-size": 12,
+        },
+      });
+
+      map.on("zoomstart", function () {
+        spiderifier.unspiderfy();
+      });
+
+      $ui.on("change", "input, select", function () {
+        getFilterValues(config);
+        updateSource(data);
+        filterDataTable();
+      });
+
+      map.on("click", "clusters", function (e) {
+        if (e.originalEvent.srcElement.className === "spider-point-circle") {
+          return;
+        }
+
+        const features = map.queryRenderedFeatures(e.point, {
+          layers: ["clusters"],
+        });
+        const clusterId = features[0].properties.cluster_id;
+        map
+          .getSource("locations")
+          .getClusterExpansionZoom(clusterId, function (err, zoom) {
+            if (err) return;
+            if (map.getZoom() !== 13) {
+              map.easeTo({
+                center: features[0].geometry.coordinates,
+                zoom: zoom,
+              });
+            }
+          });
+
+        if (!features.length || map.getZoom() !== 13) {
+          return;
+        } else {
+          map
+            .getSource("locations")
+            .getClusterLeaves(clusterId, 100, 0, function (err, leafFeatures) {
+              if (err) {
+                return console.error("problem with leaf features", err);
+              }
+              let markers = leafFeatures.map(function (leafFeature) {
+                return leafFeature.properties;
+              });
+              spiderifier.spiderfy(features[0].geometry.coordinates, markers);
+            });
+        }
+      });
+
+      // When a click event occurs on a feature in
+      // the unclustered-point layer, open a popup at
+      // the location of the feature, with
+      // description HTML from its properties.
+      map.on("click", "unclustered-point", function (e) {
+        const coordinates = e.features[0].geometry.coordinates.slice();
+        let content = popupHTML(e.features[0].properties);
+
+        while (Math.abs(e.lngLat.lng - coordinates[0]) > 180) {
+          coordinates[0] += e.lngLat.lng > coordinates[0] ? 360 : -360;
+        }
+
+        new mapboxgl.Popup().setLngLat(coordinates).setHTML(content).addTo(map);
+      });
+    });
+  }
+
+  function countMarkersFromState(state, dataarray) {
+    let count = 0;
+    dataarray.forEach((point) => {
+      if (point[S.stateColumn] === state) count++;
+    });
+    $("#count-alaska").text(count);
+    //console.log('found '+ arr.length + ' markers from ' + state)
+  }
+
+  /**
+   * Zoom the map to show all markers if there are any.
+   */
+  function zoomMapBounds(features, cfg) {
+    let bounds = new mapboxgl.LngLatBounds();
+
+    features.forEach(function (feature) {
+      bounds.extend(feature.geometry.coordinates);
+    });
+    if (features.length) {
+      map.fitBounds(bounds, { maxZoom: 5, padding: 100 });
+    } else {
+      map.easeTo({
+        center: cfg.mapCenter,
+        zoom: cfg.mapZoom,
+      });
+      alert("No entries fit the criteria.");
+    }
+  }
+
+  /**
+   * clearMarkers - remove the marker layer from the map
+   * @param  {object} markerLayer
+   */
+  function clearMarkers(markerLayer) {
+    if (markerLayer !== undefined) {
+      map.removeLayer(markerLayer);
+    } else {
+      console.log("Marker layer was undefined. Nothing to remove.");
+    }
+  }
+
+  /**
+   * filterData - find a value within an object's keys
+   * @param  {object} feature
+   * @param  {object} filters
+   * @return {boolean} true if the feature matches
+   */
+  function filterData(feature, filters) {
+    let bln = true;
+
+    Object.keys(filters).forEach((filter) => {
+      let props;
+
+      if (feature.properties[filter]) {
+        props = feature.properties[filter].split(","); // convert comma separated string to array
+
+        bln = bln && matches(props, filters[filter]);
+      }
+    });
+
+    return bln;
+  }
+
+  /**
+   * matches - check if any of the criteria match our properties
+   *
+   * @param  {array} needles list of properties of an object
+   * @param  {array} haystack array containing a list of criteria we're looking for
+   *
+   * @return {boolean} true if any of needles are in haystack
+   */
+  function matches(needles, haystack) {
+    let ismatch;
+
+    ismatch = haystack.length
+      ? haystack.some((option) => needles.indexOf(option) >= 0)
+      : true;
+    // if ( haystack.length ) {
+    //   ismatch   = haystack.some( option => needles.indexOf( option ) >= 0 )
+    // }
+
+    return ismatch;
+  }
+
+  /**
+   * escapeRegExp - make a string safe for use as a regular expression
+   * @param  {string} str input string
+   * @return {string}    string with special regex characters escaped
+   */
+  function escapeRegExp(str) {
+    return str.replace(/[\-\[\]\/\{\}\(\)\*\+\?\.\\\^\$\|]/g, "\\$&");
+  }
+
+  /**
+   * filterDataTable - use datatables search/filter function to filter the table
+   * @param  {[type]} terms [description]
+   *
+   */
+  function filterDataTable() {
+    Object.keys(config.uiFilters).forEach((filter) => {
+      let idx = config.dataHeaders.indexOf(filter);
+
+      // build out regex terms that match the word/phrase exactly
+      // eg don't let "other" match "geothermal"
+      // and escape out control characters
+      let terms = config.uiFilters[filter].map((val) => {
+        val = escapeRegExp(val);
+        return `^${val}$`;
+      });
+
+      // convert array to pipe-separated string for regex search
+      let regexterms = terms.join("|");
+
+      datatable.column(idx).search(regexterms, true, false);
+    });
+
+    datatable.draw();
+  }
+
+  /**
+   * 	Event handler for Alaska UI button
+   */
+  $(".map-navigation").on("click", "a", function (e) {
+    e.preventDefault();
+
+    const pos = $(e.delegateTarget).children().data("position");
+    if (pos) {
+      const loc = pos.split(",").reverse();
+
+      map.easeTo({
+        center: loc,
+        zoom: 3,
+      });
+    }
+  });
+})();
