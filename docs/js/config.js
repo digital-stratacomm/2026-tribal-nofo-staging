@@ -6,7 +6,7 @@ window.MAP_SETTINGS = {
   googleKey: "AIzaSyBREuwDbar39zuzrO73GJdI1L6aeYH8dLo",     // same key as the tribal map works
   mapboxToken: "pk.eyJ1IjoiZGlnaXRhbC1zdHJhdGFjb21tIiwiYSI6ImNtdXI1eHB5OTBmYjMyeHEzNGhibHBtbDAifQ.cQg7aqXe714rD1PTJaLWGg",     // same pk. token works
   spreadsheetId: "1fKktavutjxR6bbo11SkasFOJ7qAjiNBbQ8elxLQ0h3s",     // long ID between /d/ and /edit
-  sheetTab: "Data",                           // exact name of the tab
+  sheetTab: "Data v2",                           // exact name of the tab
 
   // ---- Column names (must match the sheet's header row exactly) -----
   latitudeColumn: "Latitude",
@@ -15,9 +15,13 @@ window.MAP_SETTINGS = {
   linkColumn: null,              // e.g. "Link" to make titles clickable; null = no links
 
   // ---- Table: which columns show, in order --------------------------
-  tableColumns: ["Applicant", "City", "State"],
+  tableColumns: ["Selectee", "Project", "City", "State", "DOE Investment"],
   // Column whose text becomes a link (only if linkColumn is set)
-  linkedColumn: "Applicant",
+  linkedColumn: "Selectee",
+
+  // ---- Display formatting -------------------------------------------
+  currencyColumns: ["DOE Investment"],  // shown as $1,234,567
+  abbreviateStates: true,               // table/popup show "AK"; filter keeps full names
 
   // ---- Sidebar filters ----------------------------------------------
   // type: "dropdown" (pick one) or "checkboxes" (pick several)
@@ -26,6 +30,12 @@ window.MAP_SETTINGS = {
   ],
 
   // ---- Map popups ---------------------------------------------------
-  popupTitle: "Applicant",           // big text
-  popupSubtitle: ["City", "State"],  // smaller text, joined with ", "
+  popupOnHover: true,       // show popup on mouse hover (tap still works on phones)
+  popupTitle: "Selectee",   // big text at the top
+  // Lines under the title. Columns in one line are joined with ", ".
+  popupLines: [
+    { columns: ["Project"] },
+    { columns: ["City", "State"] },
+    { label: "DOE Investment", columns: ["DOE Investment"] },
+  ],
 };

@@ -20,10 +20,43 @@
   const esc = (v) =>
     String(v == null ? "" : v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+  const STATE_ABBR = {
+    Alabama: "AL", Alaska: "AK", Arizona: "AZ", Arkansas: "AR", California: "CA", Colorado: "CO",
+    Connecticut: "CT", Delaware: "DE", Florida: "FL", Georgia: "GA", Hawaii: "HI", Idaho: "ID",
+    Illinois: "IL", Indiana: "IN", Iowa: "IA", Kansas: "KS", Kentucky: "KY", Louisiana: "LA",
+    Maine: "ME", Maryland: "MD", Massachusetts: "MA", Michigan: "MI", Minnesota: "MN",
+    Mississippi: "MS", Missouri: "MO", Montana: "MT", Nebraska: "NE", Nevada: "NV",
+    "New Hampshire": "NH", "New Jersey": "NJ", "New Mexico": "NM", "New York": "NY",
+    "North Carolina": "NC", "North Dakota": "ND", Ohio: "OH", Oklahoma: "OK", Oregon: "OR",
+    Pennsylvania: "PA", "Rhode Island": "RI", "South Carolina": "SC", "South Dakota": "SD",
+    Tennessee: "TN", Texas: "TX", Utah: "UT", Vermont: "VT", Virginia: "VA", Washington: "WA",
+    "West Virginia": "WV", Wisconsin: "WI", Wyoming: "WY", "District of Columbia": "DC",
+  };
+  const toNumber = (v) => parseFloat(String(v == null ? "" : v).replace(/[^0-9.\-]/g, ""));
+  const isCurrency = (col) => (S.currencyColumns || []).includes(col);
+  const isState = (col) => S.abbreviateStates && col === S.stateColumn;
+
+  // Text to show for a value (not used for filtering or sorting)
+  function displayValue(col, value) {
+    if (value == null || value === "") return "";
+    if (isCurrency(col)) {
+      const n = toNumber(value);
+      return isNaN(n) ? String(value) : "$" + n.toLocaleString("en-US", { maximumFractionDigits: 0 });
+    }
+    if (isState(col)) return STATE_ABBR[value] || value;
+    return String(value);
+  }
+
   function popupHTML(props) {
     const title = props[S.popupTitle] || "";
-    const sub = S.popupSubtitle.map((c) => props[c]).filter(Boolean).join(", ");
-    return (title ? "<h4>" + esc(title) + "</h4>" : "") + (sub ? "<h5>" + esc(sub) + "</h5>" : "");
+    const lines = (S.popupLines || [])
+      .map((line) => {
+        const text = line.columns.map((c) => displayValue(c, props[c])).filter(Boolean).join(", ");
+        if (!text) return "";
+        return "<p>" + (line.label ? "<strong>" + esc(line.label) + ":</strong> " : "") + esc(text) + "</p>";
+      })
+      .join("");
+    return (title ? "<h4>" + esc(title) + "</h4>" : "") + lines;
   }
 
   let map, datatable, data, spiderifier;
@@ -128,10 +161,15 @@
   function renderDataTable(dataarray) {
     // set up columns properly
     const columns = config.dataHeaders.map((header) => {
-      return {
-        title: header,
-        data: header,
-      };
+      const col = { title: header, data: header };
+      if (isCurrency(header)) {
+        col.className = "text-right";
+        col.render = (val, type) => (type === "sort" || type === "type" ? toNumber(val) : displayValue(header, val));
+      } else if (isState(header)) {
+        // show "AK", but filter/sort on the full name so the State dropdown still works
+        col.render = (val, type) => (type === "display" ? displayValue(header, val) : val);
+      }
+      return col;
     });
 
     // swap footer UI element placement
@@ -222,11 +260,22 @@
         });
         let content = popupHTML(marker);
         let popup = new mapboxgl.Popup({
+          closeButton: !S.popupOnHover,
           closeOnClick: true,
+          maxWidth: "320px",
           offset: MapboxglSpiderifier.popupOffsetForSpiderLeg(spiderLeg),
-        }).addTo(map);
+        });
         popup.setHTML(content);
-        spiderLeg.mapboxMarker.setPopup(popup);
+        spiderLeg.mapboxMarker.setPopup(popup); // click / tap
+        if (S.popupOnHover) {
+          const el = spiderLeg.elements.container;
+          el.addEventListener("mouseenter", () => {
+            if (!popup.isOpen()) spiderLeg.mapboxMarker.togglePopup();
+          });
+          el.addEventListener("mouseleave", () => {
+            if (popup.isOpen()) spiderLeg.mapboxMarker.togglePopup();
+          });
+        }
       },
     });
   }
@@ -392,16 +441,33 @@
       // the unclustered-point layer, open a popup at
       // the location of the feature, with
       // description HTML from its properties.
-      map.on("click", "unclustered-point", function (e) {
-        const coordinates = e.features[0].geometry.coordinates.slice();
-        let content = popupHTML(e.features[0].properties);
+      const pointPopup = new mapboxgl.Popup({
+        closeButton: !S.popupOnHover,
+        closeOnClick: true,
+        maxWidth: "320px",
+      });
 
+      function showPointPopup(e) {
+        const coordinates = e.features[0].geometry.coordinates.slice();
         while (Math.abs(e.lngLat.lng - coordinates[0]) > 180) {
           coordinates[0] += e.lngLat.lng > coordinates[0] ? 360 : -360;
         }
+        pointPopup.setLngLat(coordinates).setHTML(popupHTML(e.features[0].properties)).addTo(map);
+      }
 
-        new mapboxgl.Popup().setLngLat(coordinates).setHTML(content).addTo(map);
-      });
+      // Click / tap (works on phones, where there is no hover)
+      map.on("click", "unclustered-point", showPointPopup);
+
+      if (S.popupOnHover) {
+        map.on("mouseenter", "unclustered-point", (e) => {
+          map.getCanvas().style.cursor = "pointer";
+          showPointPopup(e);
+        });
+        map.on("mouseleave", "unclustered-point", () => {
+          map.getCanvas().style.cursor = "";
+          pointPopup.remove();
+        });
+      }
     });
   }
 
